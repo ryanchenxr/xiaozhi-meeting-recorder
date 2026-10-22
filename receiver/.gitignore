@@ -1,0 +1,6 @@
+.venv/
+private/
+__pycache__/
+config.local.json
+device.local.json
+openapi.local.json

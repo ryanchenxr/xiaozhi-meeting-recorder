@@ -1,0 +1,6 @@
+{
+  "bind": "auto",
+  "port": 8767,
+  "token": "换成至少 32 位的随机字符串，并与固件 meeting_config.local.h 里的 MEETING_DEVICE_TOKEN 一致",
+  "allow_processing": false
+}

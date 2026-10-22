@@ -1,0 +1,5 @@
+{
+  "openapi_key": "你的得到开放平台 API Key",
+  "client_id": "你的 Client ID",
+  "existing_member_quota_confirmed": true
+}
