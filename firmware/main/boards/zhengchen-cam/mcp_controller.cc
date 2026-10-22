@@ -79,6 +79,52 @@ public:
         }
     );
 
+    mcp_server.AddTool(
+        "self.screen.set_orientation",
+        "切换屏幕显示方向。当用户想要横屏或竖屏显示时使用此工具。\n"
+        "参数：\n"
+        "   `orientation`: 屏幕方向，可选值为`landscape`（横屏）和`portrait`（竖屏）\n"
+        "返回值：\n"
+        "   反馈状态信息，不需要确认，立即播报相关数据\n",
+        PropertyList({
+            Property("orientation", kPropertyTypeString)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto orientation = properties["orientation"].value<std::string>();
+            auto& board = Board::GetInstance();
+
+            bool landscape;
+            if (orientation == "landscape") {
+                landscape = true;
+            } else if (orientation == "portrait") {
+                landscape = false;
+            } else {
+                return "{\"success\": false, \"message\": \"无效的方向参数，请使用landscape或portrait\"}";
+            }
+
+            board.SwitchDisplayOrientation(landscape);
+
+            return landscape 
+                ? "{\"success\": true, \"message\": \"屏幕已切换为横屏模式\"}"
+                : "{\"success\": true, \"message\": \"屏幕已切换为竖屏模式\"}";
+        }
+    );
+
+    mcp_server.AddTool(
+        "self.screen.get_orientation",
+        "获取当前屏幕显示方向。当用户想知道当前是横屏还是竖屏时使用此工具。\n"
+        "返回值：\n"
+        "   反馈状态信息，不需要确认，立即播报相关数据\n",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto& board = Board::GetInstance();
+            bool is_landscape = board.IsDisplayLandscape();
+            return is_landscape 
+                ? "{\"success\": true, \"message\": \"当前屏幕为横屏模式\"}"
+                : "{\"success\": true, \"message\": \"当前屏幕为竖屏模式\"}";
+        }
+    );
+
         ESP_LOGI(TAG, "MCP工具注册完成");
     }
 

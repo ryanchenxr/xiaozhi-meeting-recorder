@@ -87,6 +87,7 @@ private:
     Pca9557* pca9557_;
     Esp32Camera* camera_;
     PowerManager* power_manager_ = new PowerManager(GPIO_NUM_47);
+    bool is_landscape_ = true;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -188,7 +189,7 @@ private:
         });
     }
 
-    void InitializeSt7789Display() {
+    void CreateDisplay(bool landscape) {
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
         // 液晶屏控制IO初始化
@@ -216,25 +217,30 @@ private:
 
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, true);
-
-        Settings settings("lcd_display", true);
-        bool is_landscape = settings.GetInt("lcd_mode", 1) != 0;
         
-        if(is_landscape) {
-            // 横屏模式
-            esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
-            esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        // NOTE: Do NOT call esp_lcd_panel_swap_xy/esp_lcd_panel_mirror here.
+        // SpiLcdDisplay passes rotation params to lvgl_port_add_disp(), which
+        // internally calls lvgl_port_disp_rotation_update() -> esp_lcd_panel_swap_xy/mirror.
+        // Calling them here would cause double-rotation (canceling out the effect).
+        
+        if(landscape) {
+            // 横屏模式: swap_xy=true, mirror_x=true, mirror_y=false
             display_ = new SpiLcdDisplay(panel_io, panel,
                                         DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
 
         } else {
-            // 竖屏模式
-            esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY_1);
-            esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X_1, DISPLAY_MIRROR_Y_1);
+            // 竖屏模式: swap_xy=false, mirror_x=false, mirror_y=false
             display_ = new SpiLcdDisplay(panel_io, panel,
                                         DISPLAY_WIDTH_1, DISPLAY_HEIGHT_1, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X_1, DISPLAY_MIRROR_Y_1, DISPLAY_SWAP_XY_1);
         }
-        
+
+        is_landscape_ = landscape;
+    }
+
+    void InitializeSt7789Display() {
+        Settings settings("lcd_display", true);
+        bool is_landscape = settings.GetInt("lcd_mode", 1) != 0;
+        CreateDisplay(is_landscape);
     }
 
     void InitializeCamera() {
@@ -327,6 +333,27 @@ public:
 
     virtual Camera* GetCamera() override {
         return camera_;
+    }
+
+    virtual void SwitchDisplayOrientation(bool landscape) override {
+        if (is_landscape_ == landscape) {
+            ESP_LOGI(TAG, "Already in %s mode, no change needed", landscape ? "landscape" : "portrait");
+            return;
+        }
+        
+        ESP_LOGI(TAG, "Switching display to %s mode, will reboot", landscape ? "landscape" : "portrait");
+        
+        // Save new orientation to NVS
+        Settings settings("lcd_display", true);
+        settings.SetInt("lcd_mode", landscape ? 1 : 0);
+        
+        // Reboot to apply new display orientation
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    }
+
+    virtual bool IsDisplayLandscape() override {
+        return is_landscape_;
     }
 };
 
