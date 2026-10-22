@@ -1,4 +1,5 @@
 #include "audio_service.h"
+#include "meeting_recorder.h"
 #include <esp_log.h>
 #include <cstring>
 
@@ -191,6 +192,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     if (codec_->input_sample_rate() != sample_rate) {
         data.resize(samples * codec_->input_sample_rate() / sample_rate * codec_->input_channels());
         if (!codec_->InputData(data)) {
+            MeetingRecorder::Get().InputFailed(MeetingDiagnostics::InputRead);
             return false;
         }
         if (input_resampler_ != nullptr) {
@@ -200,14 +202,16 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
             esp_ae_rate_cvt_get_max_out_sample_num(input_resampler_, in_sample_num, &output_samples);
             auto resampled = std::vector<int16_t>(output_samples * codec_->input_channels());
             uint32_t actual_output = output_samples;
-            esp_ae_rate_cvt_process(input_resampler_, (esp_ae_sample_t)data.data(), in_sample_num,
+            auto convert_result=esp_ae_rate_cvt_process(input_resampler_, (esp_ae_sample_t)data.data(), in_sample_num,
                                    (esp_ae_sample_t)resampled.data(), &actual_output);
+            if (convert_result != ESP_AE_ERR_OK) {MeetingRecorder::Get().InputFailed(MeetingDiagnostics::Resample,convert_result);return false;}
             resampled.resize(actual_output * codec_->input_channels());
             data = std::move(resampled);
         }
     } else {
         data.resize(samples * codec_->input_channels());
         if (!codec_->InputData(data)) {
+            MeetingRecorder::Get().InputFailed(MeetingDiagnostics::InputRead);
             return false;
         }
     }
@@ -230,7 +234,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 void AudioService::AudioInputTask() {
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
-            AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING,
+            AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_MEETING_RUNNING,
             pdFALSE, pdFALSE, portMAX_DELAY);
 
         if (service_stopped_) {
@@ -238,8 +242,10 @@ void AudioService::AudioInputTask() {
         }
         if (audio_input_need_warmup_) {
             audio_input_need_warmup_ = false;
-            vTaskDelay(pdMS_TO_TICKS(120));
-            continue;
+            if (!MeetingRecorder::Get().Protected()) {
+                vTaskDelay(pdMS_TO_TICKS(120));
+                continue;
+            }
         }
 
         /* Used for audio testing in NetworkConfiguring mode by clicking the BOOT button */
@@ -266,10 +272,11 @@ void AudioService::AudioInputTask() {
         }
 
         /* Feed the wake word and/or audio processor */
-        if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
+        if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_MEETING_RUNNING)) {
             int samples = 160; // 10ms
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
+                MeetingRecorder::Get().Feed(data, codec_->input_channels());
                 if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
                     wake_word_->Feed(data);
                 }
@@ -280,6 +287,7 @@ void AudioService::AudioInputTask() {
             }
         }
 
+        MeetingRecorder::Get().InputFailed();
         // Read timeout/error should not terminate the input task.
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -564,7 +572,7 @@ void AudioService::EnableWakeWordDetection(bool enable) {
         // This prevents buffer overflow when switching between different feed sizes
         {
             std::lock_guard<std::mutex> lock(input_resampler_mutex_);
-            if (input_resampler_ != nullptr) {
+            if (input_resampler_ != nullptr && !MeetingRecorder::Get().Protected()) {
                 esp_ae_rate_cvt_reset(input_resampler_);
             }
         }
@@ -586,12 +594,12 @@ void AudioService::EnableVoiceProcessing(bool enable) {
 
         /* We should make sure no audio is playing */
         ResetDecoder();
-        audio_input_need_warmup_ = true;
+        audio_input_need_warmup_ = !MeetingRecorder::Get().Protected();
         // Reset input resampler to clear cached data from previous mode (e.g. WakeWord)
         // This prevents buffer overflow when switching between different feed sizes
         {
             std::lock_guard<std::mutex> lock(input_resampler_mutex_);
-            if (input_resampler_ != nullptr) {
+            if (input_resampler_ != nullptr && !MeetingRecorder::Get().Protected()) {
                 esp_ae_rate_cvt_reset(input_resampler_);
             }
         }
@@ -731,4 +739,9 @@ bool AudioService::IsAfeWakeWord() {
 #else
     return false;
 #endif
+}
+
+void AudioService::EnableMeetingCapture(bool enable) {
+    if (enable) xEventGroupSetBits(event_group_, AS_EVENT_MEETING_RUNNING);
+    else xEventGroupClearBits(event_group_, AS_EVENT_MEETING_RUNNING);
 }

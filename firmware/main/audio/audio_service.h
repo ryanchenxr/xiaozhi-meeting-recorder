@@ -50,6 +50,7 @@
 #define AS_EVENT_AUDIO_TESTING_RUNNING      (1 << 0)
 #define AS_EVENT_WAKE_WORD_RUNNING          (1 << 1)
 #define AS_EVENT_AUDIO_PROCESSOR_RUNNING    (1 << 2)
+#define AS_EVENT_MEETING_RUNNING (1 << 4)
 #define AS_EVENT_PLAYBACK_NOT_EMPTY         (1 << 3)
 
 #define AS_OPUS_GET_FRAME_DRU_ENUM(duration_ms)                   \
@@ -123,6 +124,7 @@ public:
     void EnableWakeWordDetection(bool enable);
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
+    void EnableMeetingCapture(bool enable);
     void EnableDeviceAec(bool enable);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);

@@ -234,7 +234,7 @@ void BoxAudioCodec::EnableOutput(bool enable) {
 
 int BoxAudioCodec::Read(int16_t* dest, int samples) {
     if (input_enabled_) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t)));
+        if (esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t)) != ESP_OK) return 0;
     }
     return samples;
 }

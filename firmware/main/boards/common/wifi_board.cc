@@ -1,4 +1,5 @@
 #include "wifi_board.h"
+#include "meeting_recorder.h"
 
 #include "display.h"
 #include "application.h"
@@ -197,6 +198,7 @@ void WifiBoard::StartWifiConfigMode() {
 }
 
 void WifiBoard::EnterWifiConfigMode() {
+    if (MeetingRecorder::Get().BlockOperation()) return;
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
 

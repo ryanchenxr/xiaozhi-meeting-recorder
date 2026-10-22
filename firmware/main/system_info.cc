@@ -9,6 +9,8 @@
 #include <esp_app_desc.h>
 #include <esp_ota_ops.h>
 #include <esp_pm.h>
+#include <esp_heap_caps.h>
+#include <esp_wifi.h>
 #if CONFIG_IDF_TARGET_ESP32P4
 #include "esp_wifi_remote.h"
 #endif
@@ -146,9 +148,23 @@ void SystemInfo::PrintTaskList() {
 }
 
 void SystemInfo::PrintHeapStats() {
-    int free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    int min_free_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    ESP_LOGI(TAG, "free sram: %u minimal sram: %u", free_sram, min_free_sram);
+    // free/minimal: MALLOC_CAP_INTERNAL (unchanged; minimal is the per-region low-water sum).
+    // largest sram8: biggest single block for MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT (byte malloc).
+    // free psram: MALLOC_CAP_SPIRAM current free; "n/a" when no PSRAM heap exists.
+    // rssi: station RSSI in dBm from esp_wifi_sta_get_rssi; "n/a" when not associated.
+    // Called from the 1 s clock timer only; appended fields keep the old prefix parseable.
+    unsigned free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    unsigned min_free_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    unsigned largest_sram8 = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int rssi = 0;
+    char rssi_text[8] = "n/a";
+    if (esp_wifi_sta_get_rssi(&rssi) == ESP_OK) snprintf(rssi_text, sizeof(rssi_text), "%d", rssi);
+    if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0) {
+        ESP_LOGI(TAG, "free sram: %u minimal sram: %u largest sram8: %u free psram: n/a rssi: %s", free_sram, min_free_sram, largest_sram8, rssi_text);
+        return;
+    }
+    unsigned free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG, "free sram: %u minimal sram: %u largest sram8: %u free psram: %u rssi: %s", free_sram, min_free_sram, largest_sram8, free_psram, rssi_text);
 }
 
 void SystemInfo::PrintPmLocks() {

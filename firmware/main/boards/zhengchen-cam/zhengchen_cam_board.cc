@@ -2,6 +2,7 @@
 #include "audio/codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
 #include "application.h"
+#include "meeting_recorder.h"
 #include "button.h"
 #include "led/single_led.h"
 #include "config.h"
@@ -122,6 +123,10 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            MeetingRecorder::Get().RequestDiagnosticDump();
+            if (MeetingRecorder::Get().Protected()) { MeetingRecorder::Get().Stop(MeetingDiagnostics::Boot); return; }
+            // meeting.23: a click on a meeting result screen only returns to the normal screen.
+            if (MeetingRecorder::Get().DismissResult(true)) return;
             auto& app = Application::GetInstance();
             // During startup (before connected), pressing BOOT button enters Wi-Fi config mode without reboot
             if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -132,6 +137,7 @@ private:
         });
 
         boot_button_.OnDoubleClick([this]() {
+            if (MeetingRecorder::Get().BlockOperation()) return;
             Settings settings(FIRST_BOOT_NS, true);
             bool is_first_boot = settings.GetInt(FIRST_BOOT_KEY, 1) != 0;
             if (is_first_boot) {
@@ -336,6 +342,7 @@ public:
     }
 
     virtual void SwitchDisplayOrientation(bool landscape) override {
+        if (MeetingRecorder::Get().BlockOperation()) return;
         if (is_landscape_ == landscape) {
             ESP_LOGI(TAG, "Already in %s mode, no change needed", landscape ? "landscape" : "portrait");
             return;

@@ -7,11 +7,13 @@
 #include <esp_timer.h>
 
 #include <string>
+#include <atomic>
 #include <mutex>
 #include <deque>
 #include <memory>
 
 #include "protocol.h"
+#include "meeting_power_trace.h"
 #include "ota.h"
 #include "audio_service.h"
 #include "device_state.h"
@@ -103,6 +105,11 @@ public:
      */
     void StopListening();
 
+    enum class PowerReason : uint8_t { Activation,VoiceOpened,VoiceClosed,AssetsBegin,AssetsEnd,
+        UpgradeBegin,UpgradeEnd,MeetingBegin,MeetingTaskFailed,MeetingEnd,NetworkConnected,ProtocolReset };
+    void UpdatePowerSave(PowerReason reason); // serialized policy; never called from capture
+    void DumpPowerSave();
+    void BeginMeetingControl();
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
@@ -124,6 +131,10 @@ private:
     Application();
     ~Application();
 
+    std::mutex power_mutex_;
+    bool power_policy_started_=false;
+    uint8_t power_demands_=0; // voice=1, asset download=2, firmware upgrade=4
+    MeetingPowerTrace power_trace_;
     std::mutex mutex_;
     std::deque<std::function<void()>> main_tasks_;
     std::unique_ptr<Protocol> protocol_;
@@ -141,6 +152,15 @@ private:
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;
+    std::atomic<bool> meeting_control_{false};
+    std::atomic<bool> meeting_command_pending_{false};
+    bool meeting_wake_audio_pending_ = false;
+    std::atomic<uint32_t> reply_epoch_{0};
+    size_t pending_reply_packets_ = 0; // guarded by mutex_
+    size_t pending_reply_bytes_ = 0;
+    void QueueIncomingAudio(std::unique_ptr<AudioStreamPacket> packet);
+    bool SuppressMeetingReply() const;
+    std::atomic<int64_t> meeting_control_deadline_{0};
     TaskHandle_t activation_task_handle_ = nullptr;
 
 
@@ -154,7 +174,8 @@ private:
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
     void ContinueOpenAudioChannel(ListeningMode mode);
-    void ContinueWakeWordInvoke(const std::string& wake_word);
+    void ContinueWakeWordInvoke(const std::string& wake_word, uint32_t epoch, bool direct_idle);
+    void RecoverWakeWord();
 
     // Activation task (runs in background)
     void ActivationTask();

@@ -1,5 +1,6 @@
 # Define source files
-set(SOURCES "audio/audio_codec.cc"
+set(SOURCES "meeting_recorder.cc"
+            "audio/audio_codec.cc"
             "audio/audio_service.cc"
             "audio/demuxer/ogg_demuxer.cc"
             "audio/codecs/no_audio_codec.cc"
@@ -895,6 +896,7 @@ idf_component_register(SRCS ${SOURCES}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     WHOLE_ARCHIVE
                     PRIV_REQUIRES
+                        esp_http_client
                         esp_pm
                         esp_psram
                         esp_netif

@@ -1,4 +1,7 @@
 #include "application.h"
+#include "meeting_recorder.h"
+#include <esp_wifi.h>
+#include "meeting_voice_control.h"
 #include "board.h"
 #include "display.h"
 #include "system_info.h"
@@ -219,6 +222,7 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                if (MeetingRecorder::Get().Recording() && (!meeting_control_deadline_ || GetDeviceState()!=kDeviceStateListening)) continue;
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
@@ -247,6 +251,17 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+            MeetingRecorder::Get().Tick();
+            if (meeting_control_ && meeting_control_deadline_ &&
+                (esp_timer_get_time() >= meeting_control_deadline_ || !MeetingRecorder::Get().Recording())) {
+                ++reply_epoch_;
+                meeting_control_deadline_=0;
+                meeting_command_pending_=false;
+                AbortSpeaking(kAbortReasonNone);
+                audio_service_.ResetDecoder();
+                if (protocol_) protocol_->SendStopListening();
+                SetDeviceState(kDeviceStateIdle);
+            }
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
         
@@ -259,6 +274,7 @@ void Application::Run() {
 }
 
 void Application::HandleNetworkConnectedEvent() {
+    UpdatePowerSave(PowerReason::NetworkConnected);
     ESP_LOGI(TAG, "Network connected");
     auto state = GetDeviceState();
 
@@ -311,8 +327,10 @@ void Application::HandleActivationDoneEvent() {
 
     // Release OTA object after activation is complete
     ota_.reset();
-    auto& board = Board::GetInstance();
-    board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    // meeting.21: reserve the meeting upload task now, after boot HTTPS has released
+    // its internal RAM and before conversations fragment it.
+    MeetingRecorder::Get().PrepareUploadTask();
+    UpdatePowerSave(PowerReason::Activation);
 
     Schedule([this]() {
         // Play the success sound to indicate the device is ready
@@ -367,7 +385,7 @@ void Application::CheckAssetsVersion() {
         // Wait for the audio service to be idle for 3 seconds
         vTaskDelay(pdMS_TO_TICKS(3000));
         SetDeviceState(kDeviceStateUpgrading);
-        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        UpdatePowerSave(PowerReason::AssetsBegin);
         display->SetChatMessage("system", Lang::Strings::PLEASE_WAIT);
 
         bool success = assets.Download(download_url, [this, display](int progress, size_t speed) -> void {
@@ -378,7 +396,7 @@ void Application::CheckAssetsVersion() {
             });
         });
 
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        UpdatePowerSave(PowerReason::AssetsEnd);
         vTaskDelay(pdMS_TO_TICKS(1000));
 
         if (!success) {
@@ -496,21 +514,19 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
-        }
+        QueueIncomingAudio(std::move(packet));
     });
     
-    protocol_->OnAudioChannelOpened([this, codec, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    protocol_->OnAudioChannelOpened([this, codec]() {
+        UpdatePowerSave(PowerReason::VoiceOpened);
         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
             ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
                 protocol_->server_sample_rate(), codec->output_sample_rate());
         }
     });
     
-    protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    protocol_->OnAudioChannelClosed([this]() {
+        UpdatePowerSave(PowerReason::VoiceClosed);
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
@@ -524,14 +540,32 @@ void Application::InitializeProtocol() {
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
-                Schedule([this]() {
+                Schedule([this, epoch=reply_epoch_.load()]() {
+                    if(epoch!=reply_epoch_.load())return;
+                    if (SuppressMeetingReply()) return;
+                    audio_service_.ResetDecoder(); // before any ordered reply audio
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                Schedule([this]() {
+                Schedule([this, epoch=reply_epoch_.load()]() {
+                    if(epoch!=reply_epoch_.load())return;
+                    if (SuppressMeetingReply()) return;
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
+                        const int64_t now=esp_timer_get_time();
+                        if (meeting_control_ && meeting_control_deadline_ && MeetingRecorder::Get().Recording()) {
+                            // meeting.23: a reply does not end the command window. Listen
+                            // again (replies suppressed until the next utterance is classified)
+                            // and leave at least 10 s for "结束会议记录" after the reply.
+                            if(meeting_control_deadline_<now+10000000)meeting_control_deadline_=now+10000000;
+                            meeting_command_pending_=true;
+                            SetDeviceState(kDeviceStateListening);
+                        } else if (meeting_control_ || listening_mode_ == kListeningModeManualStop) {
+                            if(meeting_control_) {
+                                ++reply_epoch_;
+                                meeting_control_deadline_=0;
+                                meeting_command_pending_=false;
+                            }
                             SetDeviceState(kDeviceStateIdle);
                         } else {
                             SetDeviceState(kDeviceStateListening);
@@ -542,7 +576,8 @@ void Application::InitializeProtocol() {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring)]() {
+                    Schedule([this, display, epoch=reply_epoch_.load(), message = std::string(text->valuestring)]() {
+                        if(epoch!=reply_epoch_.load() || SuppressMeetingReply())return;
                         display->SetChatMessage("assistant", message.c_str());
                     });
                 }
@@ -551,7 +586,45 @@ void Application::InitializeProtocol() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring)]() {
+                Schedule([this, display, epoch=reply_epoch_.load(), message = std::string(text->valuestring)]() {
+                    if(epoch!=reply_epoch_.load())return;
+                    const int64_t now=esp_timer_get_time(),deadline=meeting_control_deadline_.load();
+                    auto action=MeetingVoiceControl::Classify(message,MeetingRecorder::Get().Recording(),now,deadline);
+                    if(MeetingRecorder::Get().Recording())
+                        ESP_LOGI("MeetingDiag","voice action=%s window_ms=%ld text=%s",MeetingVoiceControl::Name(action),
+                            (long)(deadline>now?(deadline-now)/1000:0),message.c_str()); // nano printf: no %lld
+                    if(action==MeetingVoiceControl::Action::Stop) {
+                        ESP_LOGI(TAG,"Meeting explicit voice stop accepted");
+                        MeetingRecorder::Get().Stop(MeetingDiagnostics::DirectVoice);
+                        ++reply_epoch_;
+                        meeting_control_deadline_=0;
+                        meeting_command_pending_=false;
+                        AbortSpeaking(kAbortReasonNone);
+                        audio_service_.EnableVoiceProcessing(false);
+                        audio_service_.ResetDecoder();
+                        if(protocol_)protocol_->SendStopListening();
+                        SetDeviceState(kDeviceStateIdle);
+                        return;
+                    }
+                    if(action==MeetingVoiceControl::Action::WaitForCommand) {
+                        // Wake-only ASR is not the command. Keep the same bounded window.
+                        if(protocol_)protocol_->SendStartListening(kListeningModeAutoStop);
+                        return;
+                    }
+                    if(action==MeetingVoiceControl::Action::Delegate && meeting_control_ && MeetingRecorder::Get().Recording()) {
+                        // meeting.23: only the first sentence after the wake word may be a
+                        // command. Anything else closes the window; the assistant stays quiet.
+                        ESP_LOGI("MeetingDiag","voice window closed: first sentence was not a stop command");
+                        ++reply_epoch_;
+                        meeting_control_deadline_=0;
+                        meeting_command_pending_=false;
+                        AbortSpeaking(kAbortReasonNone);
+                        audio_service_.ResetDecoder();
+                        if(protocol_)protocol_->SendStopListening();
+                        SetDeviceState(kDeviceStateIdle);
+                        return;
+                    }
+                    if(action==MeetingVoiceControl::Action::Delegate)meeting_command_pending_=false;
                     display->SetChatMessage("user", message.c_str());
                 });
             }
@@ -672,6 +745,13 @@ void Application::StopListening() {
 }
 
 void Application::HandleToggleChatEvent() {
+    if(!MeetingRecorder::Get().Protected()) {
+        ++reply_epoch_;
+        meeting_control_=false;
+        meeting_control_deadline_=0;
+        meeting_command_pending_=false;
+        meeting_wake_audio_pending_=false;
+    }
     auto state = GetDeviceState();
     
     if (state == kDeviceStateActivating) {
@@ -726,6 +806,13 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 }
 
 void Application::HandleStartListeningEvent() {
+    if(!MeetingRecorder::Get().Protected()) {
+        ++reply_epoch_;
+        meeting_control_=false;
+        meeting_control_deadline_=0;
+        meeting_command_pending_=false;
+        meeting_wake_audio_pending_=false;
+    }
     auto state = GetDeviceState();
     
     if (state == kDeviceStateActivating) {
@@ -774,7 +861,16 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
+    // meeting.23: talking to the assistant again leaves a finished meeting's result
+    // screen (an in-flight "processing" screen stays until its QR arrives).
+    MeetingRecorder::Get().DismissResult(false);
+    ++reply_epoch_;
+    meeting_control_ = MeetingRecorder::Get().Protected();
+    meeting_control_deadline_ = meeting_control_ ? esp_timer_get_time()+15000000 : 0;
+    meeting_command_pending_ = meeting_control_.load();
+    meeting_wake_audio_pending_ = false;
     if (!protocol_) {
+        RecoverWakeWord();
         return;
     }
 
@@ -790,13 +886,13 @@ void Application::HandleWakeWordDetectedEvent() {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update),
             // then continue with OpenAudioChannel which may block for ~1 second
-            Schedule([this, wake_word]() {
-                ContinueWakeWordInvoke(wake_word);
+            Schedule([this, wake_word, epoch=reply_epoch_.load()]() {
+                ContinueWakeWordInvoke(wake_word,epoch,false);
             });
             return;
         }
         // Channel already opened, continue directly
-        ContinueWakeWordInvoke(wake_word);
+        ContinueWakeWordInvoke(wake_word,reply_epoch_.load(),true);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
@@ -816,23 +912,60 @@ void Application::HandleWakeWordDetectedEvent() {
     } else if (state == kDeviceStateActivating) {
         // Restart the activation check if the wake word is detected during activation
         SetDeviceState(kDeviceStateIdle);
+        RecoverWakeWord();
+    } else {
+        RecoverWakeWord();
     }
 }
 
-void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
-    // Check state again in case it was changed during scheduling
-    if (GetDeviceState() != kDeviceStateConnecting) {
+void Application::RecoverWakeWord() {
+    const auto state=GetDeviceState();
+    if(state==kDeviceStateIdle || state==kDeviceStateConnecting) {
+        ++reply_epoch_;
+        meeting_control_deadline_=0;
+        meeting_command_pending_=false;
+        meeting_wake_audio_pending_=false;
+        if(state==kDeviceStateConnecting)SetDeviceState(kDeviceStateIdle);
+        audio_service_.EnableVoiceProcessing(false);
+        audio_service_.EnableWakeWordDetection(true);
+    } else if(state==kDeviceStateListening || state==kDeviceStateSpeaking) {
+        // Do not replace an active conversation with a stale connection attempt.
+        audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+    }
+    // Provisioning/upgrading/testing retain their intentional detector policy.
+    // Their existing transition to Idle restores wake detection.
+}
+
+void Application::ContinueWakeWordInvoke(const std::string& wake_word, uint32_t epoch, bool direct_idle) {
+    if(epoch!=reply_epoch_.load()) {
+        // A newer request owns Connecting/Listening. Never cancel it.
+        if(GetDeviceState()==kDeviceStateIdle)audio_service_.EnableWakeWordDetection(true);
+        return;
+    }
+    if (!protocol_ || !MeetingVoiceControl::CanContinueWake(GetDeviceState(),direct_idle && protocol_->IsAudioChannelOpened())) {
+        RecoverWakeWord();
+        return;
+    }
+    const bool opened=protocol_->IsAudioChannelOpened() || protocol_->OpenAudioChannel();
+    // OpenAudioChannel may block or provoke another state transition.
+    if(epoch!=reply_epoch_.load()) {
+        if(GetDeviceState()==kDeviceStateIdle)audio_service_.EnableWakeWordDetection(true);
+        return;
+    }
+    if(!opened || !MeetingVoiceControl::CanContinueWake(GetDeviceState(),direct_idle)) {
+        RecoverWakeWord();
         return;
     }
 
-    if (!protocol_->IsAudioChannelOpened()) {
-        if (!protocol_->OpenAudioChannel()) {
-            audio_service_.EnableWakeWordDetection(true);
-            return;
-        }
-    }
-
     ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
+    if(meeting_control_ && MeetingRecorder::Get().Protected()) {
+        // Do not send a wake-only detect request that asks the server to greet.
+        // Start ASR first; preserve the existing wake audio prefix afterwards.
+        meeting_wake_audio_pending_=true;
+        play_popup_on_listening_=true;
+        SetListeningMode(kListeningModeAutoStop);
+        return;
+    }
 #if CONFIG_SEND_WAKE_WORD_DATA
     // Encode and send the wake word data to the server
     while (auto packet = audio_service_.PopWakeWordPacket()) {
@@ -864,6 +997,13 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
+            if (meeting_control_) {
+                meeting_control_deadline_=0;
+                meeting_command_pending_=false;
+                meeting_wake_audio_pending_=false;
+                if (protocol_ && protocol_->IsAudioChannelOpened()) protocol_->SendStopListening();
+                while (audio_service_.PopPacketFromSendQueue());
+            }
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();  // Clear messages first
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
@@ -889,6 +1029,12 @@ void Application::HandleStateChangedEvent() {
                 
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
+                if(meeting_wake_audio_pending_) {
+                    meeting_wake_audio_pending_=false;
+#if CONFIG_SEND_WAKE_WORD_DATA
+                    while(auto packet=audio_service_.PopWakeWordPacket())protocol_->SendAudio(std::move(packet));
+#endif
+                }
                 audio_service_.EnableVoiceProcessing(true);
             }
 
@@ -914,7 +1060,7 @@ void Application::HandleStateChangedEvent() {
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
-            audio_service_.ResetDecoder();
+            // Reset occurs in ordered TTS start, before reply packets.
             break;
         case kDeviceStateWifiConfiguring:
             audio_service_.EnableVoiceProcessing(false);
@@ -948,10 +1094,12 @@ void Application::SetListeningMode(ListeningMode mode) {
 }
 
 ListeningMode Application::GetDefaultListeningMode() const {
+    if (meeting_control_ || MeetingRecorder::Get().Protected()) return kListeningModeAutoStop;
     return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
 }
 
 void Application::Reboot() {
+    if (MeetingRecorder::Get().BlockOperation()) return;
     ESP_LOGI(TAG, "Rebooting...");
     // Disconnect the audio channel
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
@@ -965,6 +1113,7 @@ void Application::Reboot() {
 }
 
 bool Application::UpgradeFirmware(const std::string& url, const std::string& version) {
+    if (MeetingRecorder::Get().BlockOperation()) return false;
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
 
@@ -986,7 +1135,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     std::string message = std::string(Lang::Strings::NEW_VERSION) + version_info;
     display->SetChatMessage("system", message.c_str());
 
-    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    UpdatePowerSave(PowerReason::UpgradeBegin);
     audio_service_.Stop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -1002,7 +1151,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
         // Upgrade failed, restart audio service and continue running
         ESP_LOGE(TAG, "Firmware upgrade failed, restarting audio service and continuing operation...");
         audio_service_.Start(); // Restart audio service
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER); // Restore power save level
+        UpdatePowerSave(PowerReason::UpgradeEnd); // Other demands still win
         Alert(Lang::Strings::ERROR, Lang::Strings::UPGRADE_FAILED, "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
         vTaskDelay(pdMS_TO_TICKS(3000));
         return false;
@@ -1017,7 +1166,13 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
+    ++reply_epoch_;
+    meeting_control_ = MeetingRecorder::Get().Protected();
+    meeting_control_deadline_ = meeting_control_ ? esp_timer_get_time()+15000000 : 0;
+    meeting_command_pending_ = meeting_control_.load();
+    meeting_wake_audio_pending_ = false;
     if (!protocol_) {
+        RecoverWakeWord();
         return;
     }
 
@@ -1029,13 +1184,13 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
-            Schedule([this, wake_word]() {
-                ContinueWakeWordInvoke(wake_word);
+            Schedule([this, wake_word, epoch=reply_epoch_.load()]() {
+                ContinueWakeWordInvoke(wake_word,epoch,false);
             });
             return;
         }
         // Channel already opened, continue directly
-        ContinueWakeWordInvoke(wake_word);
+        ContinueWakeWordInvoke(wake_word,reply_epoch_.load(),true);
     } else if (state == kDeviceStateSpeaking) {
         Schedule([this]() {
             AbortSpeaking(kAbortReasonNone);
@@ -1046,10 +1201,13 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
                 protocol_->CloseAudioChannel();
             }
         });
+    } else {
+        RecoverWakeWord();
     }
 }
 
 bool Application::CanEnterSleepMode() {
+    if (MeetingRecorder::Get().Protected()) return false;
     if (GetDeviceState() != kDeviceStateIdle) {
         return false;
     }
@@ -1076,6 +1234,7 @@ void Application::SendMcpMessage(const std::string& payload) {
 }
 
 void Application::SetAecMode(AecMode mode) {
+    if (MeetingRecorder::Get().BlockOperation()) return;
     aec_mode_ = mode;
     Schedule([this]() {
         auto& board = Board::GetInstance();
@@ -1114,6 +1273,100 @@ void Application::ResetProtocol() {
         }
         // Reset protocol
         protocol_.reset();
+        UpdatePowerSave(PowerReason::ProtocolReset);
     });
 }
 
+
+void Application::BeginMeetingControl() {
+    Schedule([this]() {
+        ++reply_epoch_;
+        meeting_control_=true;
+        meeting_command_pending_=false;
+        meeting_control_deadline_=esp_timer_get_time()+15000000;
+        listening_mode_=kListeningModeAutoStop;
+        audio_service_.EnableVoiceProcessing(false);
+        audio_service_.EnableWakeWordDetection(true);
+        if (protocol_) protocol_->SendStopListening();
+        while (audio_service_.PopPacketFromSendQueue());
+    });
+}
+
+// Decisions are made when ordered work executes, never against a stale receive-thread snapshot.
+bool Application::SuppressMeetingReply() const {
+    return meeting_control_ && (meeting_command_pending_ || !meeting_control_deadline_ ||
+        esp_timer_get_time() >= meeting_control_deadline_ || !MeetingRecorder::Get().Recording());
+}
+
+void Application::QueueIncomingAudio(std::unique_ptr<AudioStreamPacket> packet) {
+    constexpr size_t max_packets = MAX_DECODE_PACKETS_IN_QUEUE;
+    constexpr size_t max_bytes = 128 * 1024;
+    const size_t bytes=packet->payload.size();
+    const auto epoch=reply_epoch_.load();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(pending_reply_packets_>=max_packets || bytes>max_bytes-pending_reply_bytes_) {
+            ESP_LOGW(TAG,"Reply staging full; packet dropped");
+            return;
+        }
+        // std::function is copyable; the holder keeps one owner of the actual packet.
+        auto holder=std::make_shared<std::unique_ptr<AudioStreamPacket>>(std::move(packet));
+        ++pending_reply_packets_;
+        pending_reply_bytes_+=bytes;
+        main_tasks_.push_back([this, holder, bytes, epoch]() {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                --pending_reply_packets_;
+                pending_reply_bytes_-=bytes;
+            }
+            if(epoch!=reply_epoch_.load() || SuppressMeetingReply())return;
+            if(GetDeviceState()==kDeviceStateSpeaking)
+                audio_service_.PushPacketToDecodeQueue(std::move(*holder));
+        });
+    }
+    xEventGroupSetBits(event_group_,MAIN_EVENT_SCHEDULE);
+}
+
+void Application::UpdatePowerSave(PowerReason reason) {
+    // All application power setters enter here; never called from the capture path.
+    // Recorder observations are atomic, avoiding a power-lock -> recorder-lock cycle.
+    // Refresh reasons never carry a saved mode: resolve current meeting demand now.
+    std::lock_guard<std::mutex> lock(power_mutex_);
+    switch(reason){
+        case PowerReason::VoiceOpened:power_demands_|=1;break;
+        case PowerReason::VoiceClosed:case PowerReason::ProtocolReset:power_demands_&=~1;break;
+        case PowerReason::AssetsBegin:power_demands_|=2;break;
+        case PowerReason::AssetsEnd:power_demands_&=~2;break;
+        case PowerReason::UpgradeBegin:power_demands_|=4;break;
+        case PowerReason::UpgradeEnd:power_demands_&=~4;break;
+        default:break;
+    }
+    auto& meeting=MeetingRecorder::Get();
+    const bool needed=meeting.PowerRequired();
+    const bool performance=needed || power_demands_!=0;
+    // Preserve the original pre-activation default until a real demand/activation decision.
+    if(reason==PowerReason::NetworkConnected && !power_policy_started_ && !performance)return;
+    power_policy_started_=true;
+    Board::GetInstance().SetPowerSaveLevel(performance?PowerSaveLevel::PERFORMANCE:PowerSaveLevel::LOW_POWER);
+    wifi_ps_type_t actual=WIFI_PS_NONE;
+    const auto error=esp_wifi_get_ps(&actual);
+    MeetingPowerTrace::Entry entry;
+    entry.us=esp_timer_get_time();entry.reason=uint8_t(reason);entry.demands=power_demands_;
+    entry.meeting=needed;entry.state=meeting.PowerState();entry.requested=performance?WIFI_PS_NONE:WIFI_PS_MAX_MODEM;
+    entry.actual=error==ESP_OK?int(actual):-1;entry.query_error=error;
+    power_trace_.Add(entry);
+    char time[21];
+    ESP_LOGI("MeetingDiag","power n=%lu us=%s reason=%u demands=%u meeting=%u state=%u requested=%u actual=%ld query_error=%ld",
+        (unsigned long)(power_trace_.total-1),DiagnosticMicros(entry.us,time),unsigned(entry.reason),unsigned(entry.demands),unsigned(entry.meeting),unsigned(entry.state),unsigned(entry.requested),(long)entry.actual,(long)entry.query_error);
+}
+void Application::DumpPowerSave() {
+    std::lock_guard<std::mutex> lock(power_mutex_);
+    const auto count=std::min(power_trace_.total,uint32_t(MeetingPowerTrace::Capacity));
+    ESP_LOGI("MeetingDiag","power_begin count=%lu total=%lu",(unsigned long)count,(unsigned long)power_trace_.total);
+    for(uint32_t i=power_trace_.total-count;i<power_trace_.total;++i){
+        const auto& e=power_trace_.entries[i%MeetingPowerTrace::Capacity];char time[21];
+        ESP_LOGI("MeetingDiag","power n=%lu us=%s reason=%u demands=%u meeting=%u state=%u requested=%u actual=%ld query_error=%ld",
+            (unsigned long)e.n,DiagnosticMicros(e.us,time),unsigned(e.reason),unsigned(e.demands),unsigned(e.meeting),unsigned(e.state),unsigned(e.requested),(long)e.actual,(long)e.query_error);
+    }
+    ESP_LOGI("MeetingDiag","power_end count=%lu total=%lu",(unsigned long)count,(unsigned long)power_trace_.total);
+}

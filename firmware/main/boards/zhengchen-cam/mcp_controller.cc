@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "application.h"
+#include "meeting_recorder.h"
 #include "board.h"
 #include "config.h"
 #include "mcp_server.h"
@@ -22,6 +23,16 @@ public:
 
 	void RegisterMcpTools() {
         auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.meeting.start", "用户明确要求开始记录会议时调用。持续录音，上限60分钟；普通发言不要聊天。", PropertyList(), [](const PropertyList&) -> ReturnValue {
+            Application::GetInstance().BeginMeetingControl();
+            return MeetingRecorder::Get().Start();
+        });
+        mcp_server.AddTool("self.meeting.stop", "用户明确要求结束会议记录或停止会议录音时调用，不要只口头答应。", PropertyList(), [](const PropertyList&) -> ReturnValue {
+            return MeetingRecorder::Get().Stop(MeetingDiagnostics::Mcp);
+        });
+        mcp_server.AddTool("self.meeting.status", "查询当前会议会话和记录状态。", PropertyList(), [](const PropertyList&) -> ReturnValue {
+            return MeetingRecorder::Get().Status();
+        });
 		ESP_LOGI(TAG, "开始注册MCP工具...");
 
 	mcp_server.AddTool(
@@ -35,6 +46,7 @@ public:
             Property("mode", kPropertyTypeString)
         }), 
         [](const PropertyList& properties) -> ReturnValue {
+            if (MeetingRecorder::Get().BlockOperation()) return "请先结束会议记录";
             auto mode = properties["mode"].value<std::string>();
             auto& app = Application::GetInstance();
             vTaskDelay(pdMS_TO_TICKS(2000));
@@ -72,6 +84,7 @@ public:
         "重启设备。当用户意图重启设备时使用此工具。\n",
         PropertyList(),  
         [](const PropertyList&) -> ReturnValue {
+            if (MeetingRecorder::Get().BlockOperation()) return "请先结束会议记录";
             vTaskDelay(pdMS_TO_TICKS(1000));
             // Reboot the device
             esp_restart();
@@ -90,6 +103,7 @@ public:
             Property("orientation", kPropertyTypeString)
         }),
         [](const PropertyList& properties) -> ReturnValue {
+            if (MeetingRecorder::Get().BlockOperation()) return "请先结束会议记录";
             auto orientation = properties["orientation"].value<std::string>();
             auto& board = Board::GetInstance();
 
